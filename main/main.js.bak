@@ -1,0 +1,269 @@
+const { app, BrowserWindow, ipcMain, session, net, protocol } = require('electron');
+const path = require('path');
+const fs = require('fs');
+
+let mainWindow;
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1000,
+    height: 700,
+    minWidth: 800,
+    minHeight: 600,
+    frame: false, // 无边框窗口
+    titleBarStyle: 'hidden',
+    webPreferences: {
+      // 使用 __dirname 确保在开发和打包环境中都能正确找到 preload.js
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+      webSecurity: false,
+    },
+    backgroundColor: '#ffffff',
+    show: false, // 先隐藏，加载完再显示
+  });
+
+  // 开发环境加载 localhost，生产环境加载打包后的文件
+  const isDev = process.env.NODE_ENV === 'development' || process.env.ELECTRON_START_URL;
+
+  if (isDev) {
+      mainWindow.loadURL('http://localhost:3000');
+      mainWindow.webContents.openDevTools();
+  } else {
+      // 生产环境使用自定义协议加载
+      mainWindow.loadURL('app://./index.html');
+  }
+
+  // 监听渲染进程崩溃
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    console.error('Render process gone:', details);
+  });
+
+  // 监听页面加载失败
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('Failed to load:', errorCode, errorDescription);
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+  });
+
+  // 窗口控制 IPC
+  ipcMain.on('window-minimize', () => mainWindow.minimize());
+  ipcMain.on('window-close', () => mainWindow.close());
+}
+
+app.whenReady().then(() => {
+  // 注册自定义协议 app://
+  protocol.handle('app', async (request) => {
+    const urlStr = request.url;
+    
+    // 处理 API 代理请求 (视频流代理)
+    // 匹配 app://./api/proxy?url=...
+    if (urlStr.includes('/api/proxy')) {
+        try {
+            const urlObj = new URL(urlStr);
+            const targetUrl = urlObj.searchParams.get('url');
+            if (targetUrl) {
+                const response = await net.fetch(targetUrl);
+                // 转发响应，保留 content-type 等头信息
+                return response;
+            }
+        } catch (e) {
+            console.error('Proxy error:', e);
+            return new Response('Proxy Error', { status: 500 });
+        }
+    }
+
+    // 静态文件服务
+    let relativePath = urlStr.replace('app://./', '');
+    // 移除 query string 和 hash
+    relativePath = relativePath.split('?')[0].split('#')[0];
+    // 解码
+    relativePath = decodeURIComponent(relativePath);
+
+    // 如果是根路径，加载 index.html
+    if (relativePath === '' || relativePath === '/') {
+        relativePath = 'index.html';
+    }
+
+    // 路径安全检查，防止目录遍历
+    if (relativePath.includes('..')) {
+        return new Response('Access Denied', { status: 403 });
+    }
+
+    const filePath = path.join(__dirname, '../out', relativePath);
+
+    // 使用 pathToFileURL 处理 Windows 路径问题
+    const fileUrl = require('url').pathToFileURL(filePath).toString();
+
+    try {
+        const response = await net.fetch(fileUrl);
+        const headers = new Headers(response.headers);
+        // 添加 COOP/COEP Headers 以支持 SharedArrayBuffer (ffmpeg.wasm 需要)
+        headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+        headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+        
+        return new Response(response.body, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: headers
+        });
+    } catch (e) {
+        // 如果文件未找到，且不是静态资源（如 .js, .css），尝试返回 index.html (SPA 支持)
+        // 但 Next.js export 模式下，页面通常对应 .html 文件。
+        // 如果找不到，尝试添加 .html 后缀
+        if (!path.extname(filePath) || path.extname(filePath) === '.html') {
+             try {
+                 const htmlPath = filePath.endsWith('.html') ? filePath : filePath + '.html';
+                 const htmlUrl = require('url').pathToFileURL(htmlPath).toString();
+                 const response = await net.fetch(htmlUrl);
+                 const headers = new Headers(response.headers);
+                 headers.set('Cross-Origin-Embedder-Policy', 'require-corp');
+                 headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+                 return new Response(response.body, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: headers
+                });
+             } catch (err) {
+                 // 忽略，继续抛出原始错误或返回 404
+             }
+        }
+        console.error('File load error:', filePath, e);
+        return new Response('Not Found', { status: 404 });
+    }
+  });
+
+  createWindow();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+// 推特解析逻辑 (IPC)
+ipcMain.handle('analyze-twitter', async (event, url) => {
+  return new Promise((resolve, reject) => {
+    // 创建一个隐形的窗口用于抓取
+    const workerWindow = new BrowserWindow({
+      show: false,
+      width: 800,
+      height: 600,
+      webPreferences: {
+        offscreen: true, // 离屏渲染，更高效
+      }
+    });
+
+    const videoUrls = [];
+    let timeoutId;
+
+    // 监听网络请求
+    const filter = { urls: ['*://*/*'] };
+    workerWindow.webContents.session.webRequest.onResponseStarted(filter, (details) => {
+      const { url: responseUrl, responseHeaders } = details;
+      const contentType = (responseHeaders['content-type'] || [])[0] || '';
+
+      if (responseUrl.includes('.m3u8') && responseUrl.includes('video')) {
+        videoUrls.push({ type: 'm3u8', url: responseUrl });
+      } else if (contentType.includes('video/mp4')) {
+        videoUrls.push({ type: 'mp4', url: responseUrl });
+      }
+    });
+
+    // 加载页面
+    workerWindow.loadURL(url);
+
+    // 设置超时
+    timeoutId = setTimeout(() => {
+      workerWindow.destroy();
+      if (videoUrls.length > 0) {
+        // 去重
+        const uniqueUrls = Array.from(new Set(videoUrls.map(v => v.url)))
+            .map(url => videoUrls.find(v => v.url === url));
+        resolve({ success: true, videos: uniqueUrls });
+      } else {
+        reject(new Error('解析超时，未找到视频'));
+      }
+    }, 15000); // 15秒超时
+
+    // 也可以在页面加载完成后稍微等待一下就返回
+    workerWindow.webContents.on('did-finish-load', () => {
+       // 页面加载完后再等一会，确保视频请求发出
+       setTimeout(() => {
+           if (!workerWindow.isDestroyed()) {
+               workerWindow.destroy();
+               clearTimeout(timeoutId);
+               if (videoUrls.length > 0) {
+                   const uniqueUrls = Array.from(new Set(videoUrls.map(v => v.url)))
+                       .map(url => videoUrls.find(v => v.url === url));
+                   resolve({ success: true, videos: uniqueUrls });
+               } else {
+                   reject(new Error('未找到视频资源'));
+               }
+           }
+       }, 3000);
+    });
+  });
+});
+
+// 代理请求逻辑 (IPC) - 解决跨域和 m3u8 重写
+ipcMain.handle('proxy-request', async (event, url) => {
+    try {
+        const response = await net.fetch(url);
+        const contentType = response.headers.get('content-type');
+        const buffer = await response.arrayBuffer();
+        
+        // 如果是 m3u8，进行重写
+        if (contentType && (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('application/x-mpegurl') || url.endsWith('.m3u8'))) {
+            const text = new TextDecoder().decode(buffer);
+            const baseUrl = new URL(url);
+            
+            // 这里的重写逻辑需要配合前端。
+            // 由于我们现在是在 Electron 主进程，我们可以直接返回内容给渲染进程。
+            // 但渲染进程的 VideoPlayer 需要一个 URL。
+            // 我们可以启动一个本地微型服务器，或者使用 protocol 拦截。
+            // 为了简单，我们这里只返回数据，前端可能需要用 Blob URL。
+            // 但 m3u8 里的分片链接也需要处理。
+            
+            // 更好的方式：使用 Electron 的 protocol 模块拦截自定义协议
+            // 例如 twitter-proxy://...
+            // 但为了不改动太多架构，我们这里简单返回 text，前端处理比较麻烦。
+            
+            // 让我们换个思路：前端 VideoPlayer src 指向一个本地服务器地址？
+            // 或者，我们保持简单，只返回 buffer，前端用 Blob？
+            // m3u8 比较特殊，它里面还有链接。
+            
+            // 鉴于 Electron 环境，我们可以直接禁用 webSecurity，这样前端直接访问 m3u8 可能就行了？
+            // 不行，推特有 Referer 检查。
+            
+            // 让我们在主进程修改 headers
+            // 我们可以用 session.webRequest.onBeforeSendHeaders 来修改 Referer
+        }
+        
+        return {
+            contentType,
+            data: Buffer.from(buffer) // 返回 Buffer 给渲染进程
+        };
+    } catch (e) {
+        console.error(e);
+        throw e;
+    }
+});
+
+// 修改请求头以绕过 Referer 检查
+app.whenReady().then(() => {
+    session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+        const { url, requestHeaders } = details;
+        if (url.includes('twimg.com') || url.includes('twitter.com') || url.includes('x.com')) {
+            requestHeaders['Referer'] = 'https://twitter.com/';
+            requestHeaders['Origin'] = 'https://twitter.com/';
+        }
+        callback({ requestHeaders });
+    });
+});
